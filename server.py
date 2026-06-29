@@ -1,13 +1,14 @@
 import os
 import json
 import asyncio
-import datetime
+import sqlite3
+import requests
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-# ── Load the API key from .env (never hardcode it, never expose it to frontend) ──
+# Load the API key from .env (never hardcode it, never expose it to frontend)
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -19,7 +20,6 @@ if not GEMINI_API_KEY:
 
 MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 
-# v1beta is the standard Live API endpoint.
 GEMINI_WS_URL = (
     f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage."
     f"v1beta.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}"
@@ -27,7 +27,6 @@ GEMINI_WS_URL = (
 
 app = FastAPI()
 
-# Allow the simple HTML test client (served from file:// or localhost) to connect.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,36 +35,160 @@ app.add_middleware(
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# TOOL DEFINITION
-# This is the one guided tool the assignment requires (Requirement 3).
-# Gemini will call this when the user asks something like "what time is it".
-# ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# TOOL A: get_interview_question — real SQLite database query
+# ─────────────────────────────────────────────────────────────────────
 
-def get_current_time() -> dict:
-    """The actual Python function that runs when Gemini requests the tool."""
-    now = datetime.datetime.now().strftime("%I:%M %p on %A, %B %d, %Y")
-    return {"current_time": now}
+def get_interview_question(topic: str = None) -> dict:
+    """Fetches a real question from the local questions.db SQLite database."""
+    try:
+        conn = sqlite3.connect("questions.db")
+        cursor = conn.cursor()
+
+        if topic:
+            cursor.execute(
+                "SELECT id, question FROM questions WHERE topic = ? ORDER BY asked_count ASC, RANDOM() LIMIT 1",
+                (topic,)
+            )
+        else:
+            cursor.execute(
+                "SELECT id, question FROM questions ORDER BY asked_count ASC, RANDOM() LIMIT 1"
+            )
+
+        row = cursor.fetchone()
+
+        if row is None:
+            conn.close()
+            return {"error": f"No questions found for topic '{topic}'."}
+
+        question_id, question_text = row
+
+        cursor.execute(
+            "UPDATE questions SET asked_count = asked_count + 1 WHERE id = ?",
+            (question_id,)
+        )
+        conn.commit()
+        conn.close()
+
+        return {"question": question_text}
+
+    except sqlite3.Error as e:
+        return {"error": f"Database error: {e}"}
 
 
-# The JSON schema Gemini needs to know the tool exists. Sent inside the
-# setup message, same shape as Module 4's schema.py.
-TOOLS_CONFIG = [{
-    "functionDeclarations": [{
-        "name": "get_current_time",
-        "description": "Returns the current local date and time.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {},
-            "required": []
+GET_QUESTION_TOOL = {
+    "name": "get_interview_question",
+    "description": (
+        "Fetches a real UPSC interview question from the question bank. "
+        "Call this to ask the candidate a new question. Optionally specify "
+        "a topic (Polity, Economy, Geography, CurrentAffairs, or Ethics) "
+        "if the conversation has been focused on one area; otherwise omit "
+        "topic to get any question."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "topic": {
+                "type": "STRING",
+                "description": "Optional topic filter: Polity, Economy, Geography, CurrentAffairs, or Ethics"
+            }
+        },
+        "required": []
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# TOOL B: check_fact — real Wikipedia API call (interviewer-side verify)
+# ─────────────────────────────────────────────────────────────────────
+
+def check_fact(topic: str) -> dict:
+    """Fetches a real summary from Wikipedia's API for a given topic."""
+    try:
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{topic}"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code == 404:
+            return {"error": f"No Wikipedia entry found for '{topic}'."}
+
+        response.raise_for_status()
+        data = response.json()
+
+        return {
+            "summary": data.get("extract", "No summary available."),
+            "title": data.get("title", topic)
         }
-    }]
-}]
+
+    except requests.exceptions.RequestException:
+        return {"error": "Fact-check service currently unavailable."}
+
+
+CHECK_FACT_TOOL = {
+    "name": "check_fact",
+    "description": (
+        "Looks up a factual summary of a topic from Wikipedia to silently "
+        "verify the accuracy of the candidate's answer. Use this internally "
+        "to judge correctness — do NOT tell the candidate you are looking "
+        "something up; use the result to decide whether to challenge a "
+        "vague or incorrect answer."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "topic": {
+                "type": "STRING",
+                "description": "The topic or claim to fact-check, e.g. 'Article 370' or 'fiscal deficit'"
+            }
+        },
+        "required": ["topic"]
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PERSONA — strict UPSC interview board member
+# ─────────────────────────────────────────────────────────────────────
+
+PERSONA_PROMPT = """
+# IDENTITY
+You are a senior UPSC interview board member conducting a mock Civil
+Services personality test interview. You are formal, precise, and
+unimpressed by vague or rehearsed answers. This is a VOICE conversation —
+speak in natural spoken sentences, never read out lists or markdown.
+
+# OPERATIONAL BOUNDARY
+You ONLY conduct interview questions, ask follow-ups, and evaluate answers.
+You do not chat about unrelated topics. If the candidate goes off-topic,
+redirect them back to the interview in one sentence.
+
+# CORE BEHAVIOR — DO NOT LET ANSWERS OFF THE HOOK
+If a candidate's answer is vague, generic, or avoids the actual question,
+you must press them: ask for a specific example, a number, a named case,
+or a clearer definition. Do not accept "it depends" or "there are many
+factors" as a complete answer — ask them to commit to a position and
+defend it.
+
+If you are unsure whether a candidate's factual claim is accurate, use the
+check_fact tool silently to verify before responding. If their claim is
+wrong, correct them directly but respectfully — do not let an incorrect
+fact pass unchallenged.
+
+Use get_interview_question whenever you need to ask a new question, or to
+move to a new topic after a candidate has answered the current one
+adequately.
+
+# TONE
+Calm, formal, occasionally pointed. Not unkind, but not warm either — this
+is a real interview, not a friendly chat. Short, direct sentences.
+
+# GUARDRAILS
+Never invent facts. If check_fact fails or returns nothing useful, say so
+plainly rather than guessing. If a tool call fails, tell the candidate
+there was a technical issue and continue the interview without it.
+"""
 
 
 def build_setup_message() -> dict:
-    """The first message that must be sent on the Gemini WebSocket.
-    Without this, Gemini rejects the session outright."""
     return {
         "setup": {
             "model": MODEL,
@@ -73,10 +196,10 @@ def build_setup_message() -> dict:
                 "responseModalities": ["AUDIO"]
             },
             "systemInstruction": {
-                "parts": [{"text": "You are a helpful voice assistant for The Panel app. Be concise. You do NOT know the current date or time on your own. You MUST call the get_current_time function every single time the user asks about the date or time, without exception. Never guess or state a time from memory."}]
+                "parts": [{"text": PERSONA_PROMPT}]
             },
             "tools": [{
-                "functionDeclarations": TOOLS_CONFIG[0]["functionDeclarations"]
+                "functionDeclarations": [GET_QUESTION_TOOL, CHECK_FACT_TOOL]
             }]
         }
     }
@@ -84,7 +207,6 @@ def build_setup_message() -> dict:
 
 @app.get("/health")
 def health_check():
-    """Quick way to confirm the server is alive: visit http://localhost:8000/health"""
     return {"status": "ok", "message": "Panel voice proxy is running"}
 
 
@@ -93,46 +215,43 @@ async def proxy_endpoint(client_ws: WebSocket):
     await client_ws.accept()
     print("[FRONTEND] Client connected.")
 
+    # Shared flag so either loop can tell the other the client is gone.
+    client_alive = {"ok": True}
+
     try:
         async with websockets.connect(GEMINI_WS_URL) as gemini_ws:
             print("[GEMINI] Connected to Gemini Live API.")
 
-            # ── TODO 1 (done): send setup message FIRST ──
             setup_msg = build_setup_message()
             await gemini_ws.send(json.dumps(setup_msg))
             print("[GEMINI] Setup message sent. Waiting for setupComplete...")
 
-            # Wait for Gemini to confirm the session is ready before doing anything else.
             setup_response = await gemini_ws.recv()
             print(f"[GEMINI] Setup response: {setup_response}")
 
-            # ── TODO 2: client -> gemini loop ──
             async def client_to_gemini():
-                """Receives audio (or text, for testing) from the frontend
-                and forwards it to Gemini as a realtimeInput message."""
+                """Frontend -> Gemini: forward mic audio (or typed text)."""
                 try:
                     while True:
                         message = await client_ws.receive()
 
                         if message["type"] == "websocket.disconnect":
+                            client_alive["ok"] = False
                             break
 
                         if "bytes" in message and message["bytes"] is not None:
-                            # Real microphone audio: raw 16-bit PCM, 16kHz, mono.
                             audio_b64 = _b64encode(message["bytes"])
                             payload = {
                                 "realtimeInput": {
-                                    "mediaChunks": [{
-                                        "mimeType": "audio/pcm;rate=16000",
-                                        "data": audio_b64
-                                    }]
+                                    "audio": {
+                                        "data": audio_b64,
+                                        "mimeType": "audio/pcm;rate=16000"
+                                    }
                                 }
                             }
                             await gemini_ws.send(json.dumps(payload))
 
                         elif "text" in message and message["text"] is not None:
-                            # Lets us test with typed text before audio is wired,
-                            # without needing a microphone at all.
                             text_payload = {
                                 "clientContent": {
                                     "turns": [{
@@ -146,18 +265,17 @@ async def proxy_endpoint(client_ws: WebSocket):
 
                 except WebSocketDisconnect:
                     print("[FRONTEND] Client disconnected (client_to_gemini).")
+                    client_alive["ok"] = False
                 except Exception as e:
                     print(f"[ERROR] client_to_gemini: {e}")
+                    client_alive["ok"] = False
 
-            # ── TODO 3: gemini -> client loop, including tool-call handling ──
             async def gemini_to_client():
-                """Receives audio / text / tool-call requests from Gemini
-                and either forwards them to the frontend or handles them locally."""
+                """Gemini -> Frontend: forward audio/text, handle tool calls
+                and barge-in. A single failed send never kills this loop —
+                that is what keeps barge-in alive across the whole session."""
                 try:
                     async for raw_message in gemini_ws:
-                        # Gemini sends JSON text frames (even for audio --
-                        # audio bytes are base64-encoded INSIDE the JSON,
-                        # not sent as raw binary frames over this socket).
                         try:
                             data = json.loads(raw_message)
                         except (json.JSONDecodeError, TypeError):
@@ -173,9 +291,12 @@ async def proxy_endpoint(client_ws: WebSocket):
                             for fc in tool_call.get("functionCalls", []):
                                 fn_name = fc.get("name")
                                 fn_id = fc.get("id")
+                                fn_args = fc.get("args", {})
 
-                                if fn_name == "get_current_time":
-                                    result = get_current_time()
+                                if fn_name == "get_interview_question":
+                                    result = get_interview_question(**fn_args)
+                                elif fn_name == "check_fact":
+                                    result = check_fact(**fn_args)
                                 else:
                                     result = {"error": f"Unknown tool: {fn_name}"}
 
@@ -192,38 +313,45 @@ async def proxy_endpoint(client_ws: WebSocket):
                             }
                             await gemini_ws.send(json.dumps(tool_response_payload))
                             print(f"[TOOL RESPONSE] Sent back: {tool_response_payload}")
-                            continue  # don't also forward the raw toolCall to frontend
+                            continue
+
+                        server_content = data.get("serverContent")
+
+                        # --- BARGE-IN: handle FIRST, before any audio ---
+                        if server_content and server_content.get("interrupted"):
+                            print("[BARGE-IN] User interrupted. Flushing playback.")
+                            await _safe_send_text(client_ws, json.dumps({"type": "flush"}), client_alive)
+                            continue
 
                         # --- Audio / text forwarding to frontend ---
-                        server_content = data.get("serverContent")
                         if server_content:
                             model_turn = server_content.get("modelTurn")
                             if model_turn:
                                 for part in model_turn.get("parts", []):
                                     inline_data = part.get("inlineData")
                                     if inline_data and inline_data.get("data"):
-                                        # Audio comes back as base64 inside JSON.
-                                        # Decode it and send as a true binary
-                                        # WebSocket frame to the frontend so the
-                                        # browser can play it directly.
                                         audio_bytes = _b64decode(inline_data["data"])
-                                        await client_ws.send_bytes(audio_bytes)
+                                        await _safe_send_bytes(client_ws, audio_bytes, client_alive)
                                     text_part = part.get("text")
                                     if text_part:
-                                        await client_ws.send_text(json.dumps({
-                                            "type": "text",
-                                            "text": text_part
-                                        }))
+                                        await _safe_send_text(
+                                            client_ws,
+                                            json.dumps({"type": "text", "text": text_part}),
+                                            client_alive
+                                        )
 
                             if server_content.get("turnComplete"):
-                                await client_ws.send_text(json.dumps({"type": "turnComplete"}))
+                                await _safe_send_text(
+                                    client_ws,
+                                    json.dumps({"type": "turnComplete"}),
+                                    client_alive
+                                )
 
                 except websockets.exceptions.ConnectionClosed:
                     print("[GEMINI] Connection closed.")
                 except Exception as e:
                     print(f"[ERROR] gemini_to_client: {e}")
 
-            # ── TODO 4: run both loops concurrently ──
             await asyncio.gather(
                 client_to_gemini(),
                 gemini_to_client()
@@ -237,7 +365,28 @@ async def proxy_endpoint(client_ws: WebSocket):
         print("[SESSION] Closed.")
 
 
-# ── small helpers, kept local so this file has zero extra dependencies ──
+# ─────────────────────────────────────────────────────────────────────
+# Safe send helpers: a failed send (client gone) is swallowed quietly so
+# it never crashes the receive loop or leaves Gemini in a bad state.
+# ─────────────────────────────────────────────────────────────────────
+
+async def _safe_send_bytes(client_ws, data, client_alive):
+    if not client_alive["ok"]:
+        return
+    try:
+        await client_ws.send_bytes(data)
+    except Exception:
+        client_alive["ok"] = False
+
+async def _safe_send_text(client_ws, text, client_alive):
+    if not client_alive["ok"]:
+        return
+    try:
+        await client_ws.send_text(text)
+    except Exception:
+        client_alive["ok"] = False
+
+
 import base64
 
 def _b64encode(data: bytes) -> str:

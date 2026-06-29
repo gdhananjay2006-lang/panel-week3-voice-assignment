@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>The Panel — Voice Test Client</title>
+<title>The Panel — Voice Test Client (Week 4)</title>
 <style>
   body {
     font-family: -apple-system, sans-serif;
@@ -26,11 +26,10 @@
     margin: 10px;
   }
   button:disabled { background: #64748B; cursor: not-allowed; }
-  button.recording { background: #DC2626; }
   #log {
     width: 600px;
     max-width: 90vw;
-    height: 300px;
+    height: 320px;
     overflow-y: auto;
     background: #14233a;
     border-radius: 8px;
@@ -47,31 +46,36 @@
     border: none;
     margin-bottom: 10px;
   }
+  .flush-flash { color: #FBBF24; font-weight: bold; }
+  .mic-live { color: #4ADE80; }
 </style>
 </head>
 <body>
-  <h2>The Panel — Voice Test Client</h2>
+  <h2>The Panel — Voice Test Client (Week 4)</h2>
   <p id="status">Status: Disconnected</p>
+  <p id="micStatus" style="font-size:13px; color:#64748B;">Mic: off</p>
 
   <div>
-    <button id="connectBtn">Connect to Proxy</button>
-    <button id="recordBtn" disabled>🎤 Hold to Talk</button>
+    <button id="connectBtn">Connect (mic starts automatically)</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
   </div>
 
-  <input id="typeBox" placeholder="Or type a message and press Enter (e.g. 'what time is it?')" disabled>
+  <input id="typeBox" placeholder="Or type a message and press Enter" disabled>
 
   <div id="log"></div>
 
 <script>
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
+const micStatusEl = document.getElementById('micStatus');
 const connectBtn = document.getElementById('connectBtn');
-const recordBtn = document.getElementById('recordBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
 const typeBox = document.getElementById('typeBox');
 
-function log(msg) {
+function log(msg, cls) {
   const time = new Date().toLocaleTimeString();
-  logEl.textContent += `[${time}] ${msg}\n`;
+  const span = cls ? `<span class="${cls}">${msg}</span>` : msg;
+  logEl.innerHTML += `[${time}] ${span}\n`;
   logEl.scrollTop = logEl.scrollHeight;
 }
 
@@ -82,6 +86,7 @@ let processor = null;
 
 let playbackContext = null;
 let playbackTime = 0;
+let activeSources = [];
 
 function initPlayback() {
   if (!playbackContext) {
@@ -108,57 +113,33 @@ function playPCM16(arrayBuffer) {
   if (playbackTime < now) playbackTime = now;
   source.start(playbackTime);
   playbackTime += buffer.duration;
+
+  activeSources.push(source);
+  source.onended = () => {
+    activeSources = activeSources.filter(s => s !== source);
+  };
 }
 
-connectBtn.onclick = () => {
-  ws = new WebSocket('ws://localhost:8000/ws');
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    statusEl.textContent = 'Status: Connected';
-    log('Connected to proxy server.');
-    recordBtn.disabled = false;
-    typeBox.disabled = false;
-    connectBtn.disabled = true;
-  };
-
-  ws.onmessage = (event) => {
-    if (typeof event.data === 'string') {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'text') log('Gemini (text): ' + data.text);
-        else if (data.type === 'turnComplete') log('--- turn complete ---');
-        else log('Received: ' + event.data);
-      } catch {
-        log('Received (raw text): ' + event.data);
-      }
-    } else {
-      log('Received audio chunk (' + event.data.byteLength + ' bytes), playing...');
-      playPCM16(event.data);
-    }
-  };
-
-  ws.onerror = (e) => log('WebSocket error (see browser console for details).');
-  ws.onclose = () => {
-    statusEl.textContent = 'Status: Disconnected';
-    log('Disconnected from proxy.');
-    recordBtn.disabled = true;
-    typeBox.disabled = true;
-    connectBtn.disabled = false;
-  };
-};
-
-typeBox.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && typeBox.value.trim()) {
-    const msg = typeBox.value.trim();
-    log('You (text): ' + msg);
-    ws.send(msg);
-    typeBox.value = '';
+function flushPlayback() {
+  log('>>> INTERRUPTED — flushing playback queue', 'flush-flash');
+  activeSources.forEach(source => {
+    try { source.stop(); } catch (e) { /* already stopped, ignore */ }
+  });
+  activeSources = [];
+  if (playbackContext) {
+    playbackTime = playbackContext.currentTime;
   }
-});
+}
 
-async function startRecording() {
-  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } });
+async function startContinuousMic() {
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,   // cancel the bot's own voice coming back through the speakers
+      noiseSuppression: true,   // keep room noise from tripping Gemini's VAD
+      autoGainControl: true,
+    }
+  });
   audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
   const source = audioContext.createMediaStreamSource(mediaStream);
 
@@ -178,23 +159,76 @@ async function startRecording() {
     }
   };
 
-  log('Recording started. Speak now...');
+  micStatusEl.textContent = 'Mic: LIVE — speak anytime, including mid-response to interrupt';
+  micStatusEl.className = 'mic-live';
+  log('Mic is live and streaming continuously.');
 }
 
-function stopRecording() {
+function stopMic() {
   if (processor) { processor.disconnect(); processor = null; }
   if (audioContext) { audioContext.close(); audioContext = null; }
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-  log('Recording stopped.');
+  micStatusEl.textContent = 'Mic: off';
+  micStatusEl.className = '';
 }
 
-recordBtn.addEventListener('mousedown', () => {
-  recordBtn.classList.add('recording');
-  startRecording();
-});
-recordBtn.addEventListener('mouseup', () => {
-  recordBtn.classList.remove('recording');
-  stopRecording();
+connectBtn.onclick = async () => {
+  ws = new WebSocket('ws://localhost:8000/ws');
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    statusEl.textContent = 'Status: Connected';
+    log('Connected to proxy server.');
+    typeBox.disabled = false;
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+
+    try {
+      await startContinuousMic();
+    } catch (err) {
+      log('Mic permission error: ' + err.message);
+    }
+  };
+
+  ws.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'text') log('Gemini (text): ' + data.text);
+        else if (data.type === 'turnComplete') log('--- turn complete ---');
+        else if (data.type === 'flush') flushPlayback();
+        else log('Received: ' + event.data);
+      } catch {
+        log('Received (raw text): ' + event.data);
+      }
+    } else {
+      log('Received audio chunk (' + event.data.byteLength + ' bytes), playing...');
+      playPCM16(event.data);
+    }
+  };
+
+  ws.onerror = (e) => log('WebSocket error (see browser console for details).');
+  ws.onclose = () => {
+    statusEl.textContent = 'Status: Disconnected';
+    log('Disconnected from proxy.');
+    typeBox.disabled = true;
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+    stopMic();
+  };
+};
+
+disconnectBtn.onclick = () => {
+  if (ws) ws.close();
+};
+
+typeBox.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && typeBox.value.trim()) {
+    const msg = typeBox.value.trim();
+    log('You (text): ' + msg);
+    ws.send(msg);
+    typeBox.value = '';
+  }
 });
 </script>
 </body>
